@@ -26,6 +26,8 @@ from mqtt.zmai_meter import ZmaiMeter, ZMAI_TOPIC_PREFIX
 from pi_throttle import read_throttled_hex, decode_active_flags
 
 BMS_OFFLINE_NO_SOLAR_TIMEOUT_SECONDS = 3 * 3600
+MODE_VERIFY_INTERVAL_SECONDS = 600
+PREEMPTIVE_SOC_MARGIN_PCT = 3
 
 
 def notify_systemd(message):
@@ -34,6 +36,7 @@ def notify_systemd(message):
         return
     if socket_address.startswith("@"):
         socket_address = "\0" + socket_address[1:]
+
     notify_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     notify_socket.connect(socket_address)
     notify_socket.sendall(message.encode())
@@ -50,16 +53,19 @@ class SolarMonitor:
             settings.NPE_BOND_THRESHOLD_W,
             settings.NPE_BOND_STABLE_SECONDS,
         )
+
         self.inverter = DaxtromnInverter(settings.INVERTER_PORT, settings.INVERTER_BAUD, settings.INVERTER_STALE_SECONDS)
         self.can_battery = CanBattery(settings.CAN_INTERFACE, settings.CAN_BATTERY_STALE_SECONDS)
         self.inverter_alarm = Alarm("inverter-silent", settings.ALARM_REPEAT_SECONDS)
         self.failsafe_alarm = Alarm("npe-failsafe-blind", settings.ALARM_REPEAT_SECONDS)
+
         self.battery_low_alarm = Alarm("battery-low-voltage", settings.ALARM_REPEAT_SECONDS)
         self.battery_mode = BatteryMode(
             settings.BATTERY_DISCHARGE_STOP_SOC_PCT,
             settings.BATTERY_RESUME_SOC_PCT,
         )
         self.undervoltage_alarm = Alarm("pi-undervoltage", settings.ALARM_REPEAT_SECONDS)
+
         self.client = mqtt.Client()
         self.discovery = HomeAssistantDiscovery(self.client)
         self._initialize_state()
@@ -68,14 +74,17 @@ class SolarMonitor:
         self._bms_was_online = None
         self._bms_offline_no_solar_since = None
         self._bms_offline_fallback_active = False
+        self._last_mode_verify_time = None
         self.last_applied_priority = None
         self.output_priority_fault = False
         self.last_applied_charger_source = None
+
         self.pv_efficiency = settings.PV_EFFICIENCY_DEFAULT
         self.pv2_pv1_ratio = settings.PV2_PV1_RATIO_DEFAULT
         self.battery_charge_energy_kwh = 0.0
         self.battery_discharge_energy_kwh = 0.0
         self.last_battery_cycle_time = None
+
         self._command_handlers = {
             settings.NPE_MODE_TOPIC: self._handle_npe_mode,
             settings.BATTERY_MODE_TOPIC: self._handle_battery_mode,
@@ -102,6 +111,7 @@ class SolarMonitor:
 
     def _on_connect(self, client, userdata, flags, result_code):
         client.publish(settings.AVAILABILITY_TOPIC, "online", retain=True)
+
         for command_topic in self._command_handlers:
             client.subscribe(command_topic)
         client.subscribe(f"{ZMAI_TOPIC_PREFIX}/+/get")
@@ -111,6 +121,7 @@ class SolarMonitor:
     def _on_message(self, client, userdata, message):
         payload = message.payload.decode().strip()
         handler = self._command_handlers.get(message.topic)
+
         if handler is not None:
             handler(payload)
         else:
@@ -130,6 +141,7 @@ class SolarMonitor:
         if not is_number(payload):
             return
         value = float(payload)
+
         if 0.5 <= value <= 1.0:
             self.pv_efficiency = value
             print(f"pv efficiency set to {value}", flush=True)
@@ -138,6 +150,7 @@ class SolarMonitor:
         if not is_number(payload):
             return
         value = float(payload)
+
         if 0.1 <= value <= 1.0:
             self.pv2_pv1_ratio = value
             print(f"pv2/pv1 ratio set to {value}", flush=True)
@@ -146,6 +159,7 @@ class SolarMonitor:
         if not is_number(payload):
             return
         value = int(float(payload))
+
         if 10 <= value <= 50:
             self.battery_mode.stop_soc_pct = value
             print(f"discharge stop SOC set to {value}%", flush=True)
@@ -154,6 +168,7 @@ class SolarMonitor:
         if not is_number(payload):
             return
         value = int(float(payload))
+
         if 50 <= value <= 100:
             self.battery_mode.resume_soc_pct = value
             print(f"discharge resume SOC set to {value}%", flush=True)
@@ -162,6 +177,7 @@ class SolarMonitor:
         if not is_number(payload):
             return
         value = int(float(payload))
+
         if 20 <= value <= 100:
             self.battery_mode.quick_charge_switch_soc_pct = value
             print(f"quick charge switch SOC set to {value}%", flush=True)
@@ -176,11 +192,13 @@ class SolarMonitor:
 
     def _load_initial_inverter_state(self):
         initial_priority = self.inverter.query_output_source_priority()
+
         if initial_priority is not None:
             self.last_applied_priority = initial_priority
             print(f"initial output priority: {initial_priority}", flush=True)
 
         initial_charger_source = self.inverter.query_charger_source_priority()
+
         if initial_charger_source is not None:
             self.last_applied_charger_source = initial_charger_source
             print(f"initial charger source: {initial_charger_source}", flush=True)
@@ -191,10 +209,12 @@ class SolarMonitor:
         self.can_battery.start()
         print("solar_monitor started", flush=True)
         notify_systemd("READY=1")
+
         while True:
             cycle_start = time.time()
             notify_systemd("WATCHDOG=1")
             self._run_cycle(cycle_start)
+
             if self._source_files_changed():
                 print("source files changed, restarting", flush=True)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -205,18 +225,22 @@ class SolarMonitor:
         inverter_data = self.inverter.poll(now)
         battery_power_w = None
         pv_total_power_w = 0
+
         if inverter_data is not None:
             self._publish_inverter_fields(inverter_data)
             battery_power_w = self._compute_battery_power(inverter_data, now)
             battery_contribution_w = battery_power_w if self.inverter.is_battery_present(inverter_data) else 0.0
             pv_total_power_w = self._estimate_pv_power(inverter_data, battery_contribution_w, grid_power_for_pv2)
+
         self._publish_link_status(zmai_online, now)
         self._publish_can_battery(now)
         can_data = self.can_battery.get_data() if self.can_battery.has_recent_data(now) else None
         battery_present, estimated_soc, battery_is_low, bms_available = self._assess_battery(inverter_data, can_data, now)
         self._check_bms_offline_fallback(inverter_data, bms_available, battery_present, now)
         pv_power_for_mode = inverter_data.get("pv1_power_w") if inverter_data is not None else None
+
         self._apply_battery_mode(estimated_soc, battery_present, bms_available, pv_power_for_mode)
+        self._verify_inverter_mode(estimated_soc, battery_present, now)
         ac_input_voltage_v = inverter_data.get("ac_input_voltage_v") if inverter_data is not None else None
         inverter_online = self.inverter.has_recent_data(now)
         self._apply_npe_bonding(ac_input_voltage_v, grid_power_for_npe, zmai_online, inverter_online, now)
@@ -229,12 +253,14 @@ class SolarMonitor:
             self.client.publish(f"{settings.BASE_TOPIC}/zmai/voltage_v", self.zmai_meter.voltage_v)
         if self.zmai_meter.current_a is not None:
             self.client.publish(f"{settings.BASE_TOPIC}/zmai/current_a", self.zmai_meter.current_a)
+
         zmai_online = self.zmai_meter.has_recent_data(now, settings.ZMAI_STALE_SECONDS)
         self.client.publish(f"{settings.BASE_TOPIC}/zmai/data_status", "online" if zmai_online else "offline")
         zmai_has_reading = zmai_online and self.zmai_meter.power_w is not None
         grid_power_for_npe = self.zmai_meter.power_w if zmai_has_reading else None
         power_above_noise = zmai_has_reading and abs(self.zmai_meter.power_w) >= settings.ZMAI_NOISE_THRESHOLD_W
         grid_power_for_pv2 = self.zmai_meter.power_w if power_above_noise else None
+
         return zmai_online, grid_power_for_npe, grid_power_for_pv2
 
     def _publish_inverter_fields(self, inverter_data):
@@ -243,15 +269,18 @@ class SolarMonitor:
 
     def _compute_battery_power(self, inverter_data, now):
         required_fields = ("battery_voltage_v", "battery_charging_current_a", "battery_discharge_current_a")
+
         for field_name in required_fields:
             if field_name not in inverter_data:
                 return None
+
         net_current_a = inverter_data["battery_discharge_current_a"] - inverter_data["battery_charging_current_a"]
         battery_power_w = net_current_a * inverter_data["battery_voltage_v"]
         self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_power_w", battery_power_w)
         self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_charge_power_w", max(-battery_power_w, 0))
         self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_discharge_power_w", -max(battery_power_w, 0))
         self._accumulate_battery_energy(battery_power_w, now)
+
         return battery_power_w
 
     def _accumulate_battery_energy(self, battery_power_w, now):
@@ -261,6 +290,7 @@ class SolarMonitor:
                 self.battery_charge_energy_kwh += abs(battery_power_w) * elapsed_hours / 1000
             elif battery_power_w > 0:
                 self.battery_discharge_energy_kwh += battery_power_w * elapsed_hours / 1000
+
             self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_charge_energy_kwh", round(self.battery_charge_energy_kwh, 3))
             self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_discharge_energy_kwh", round(self.battery_discharge_energy_kwh, 3))
         self.last_battery_cycle_time = now
@@ -269,17 +299,21 @@ class SolarMonitor:
         ac_output_w = inverter_data["ac_output_power_w"]
         pv1_power_w = inverter_data["pv1_power_w"]
         total_pv_w = None
+
         if grid_power_w is not None:
             device_status = inverter_data.get("device_status", "00000000")
             ac_charging_from_grid = len(device_status) > 7 and device_status[7] == "1"
             total_pv_as_import = (ac_output_w - grid_power_w) / self.pv_efficiency - battery_contribution_w
+
             if ac_charging_from_grid or total_pv_as_import >= pv1_power_w:
                 total_pv_w = total_pv_as_import
+
         if total_pv_w is None:
             total_pv_w = ac_output_w / self.pv_efficiency - battery_contribution_w
         pv2_from_balance_w = total_pv_w - pv1_power_w
         if pv2_from_balance_w < pv1_power_w * 0.05 and pv1_power_w > settings.PV2_RATIO_MIN_PV1_W:
             total_pv_w = pv1_power_w * (1 + self.pv2_pv1_ratio)
+
         return total_pv_w
 
     def _estimate_pv_power(self, inverter_data, battery_contribution_w, grid_power_w):
@@ -287,13 +321,16 @@ class SolarMonitor:
             return 0
         if battery_contribution_w is None:
             return 0
+
         total_pv_w = self._estimate_total_pv_watts(inverter_data, battery_contribution_w, grid_power_w)
         pv1_power_w = inverter_data["pv1_power_w"]
         pv2_power_w = max(total_pv_w - pv1_power_w, 0)
         pv_total_power_w = pv1_power_w + pv2_power_w
+
         self.client.publish(f"{settings.BASE_TOPIC}/derived/pv2_power_w", pv2_power_w)
         self.client.publish(f"{settings.BASE_TOPIC}/derived/pv_total_power_w", pv_total_power_w)
         self.client.publish(f"{settings.BASE_TOPIC}/pv/efficiency/state", self.pv_efficiency)
+
         return pv_total_power_w
 
     def _publish_link_status(self, zmai_online, now):
@@ -308,6 +345,7 @@ class SolarMonitor:
         can_online = self.can_battery.has_recent_data(now)
         self.client.publish(f"{settings.BASE_TOPIC}/can_battery/data_status", "online" if can_online else "offline")
         can_data = self.can_battery.get_data()
+
         if can_data is None:
             return
         for field_name, field_value in can_data.items():
@@ -320,6 +358,7 @@ class SolarMonitor:
         self._publish_bms_status_change(bms_available)
         inverter_voltage = inverter_data.get("battery_voltage_v", 0) if inverter_data is not None else 0
         inverter_soc = 0
+
         if battery_present and inverter_voltage > 0:
             inverter_soc = estimate_soc_from_voltage(inverter_voltage)
         if bms_available:
@@ -332,14 +371,17 @@ class SolarMonitor:
             voltage_for_low_check = can_data["bms_voltage_v"]
         else:
             voltage_for_low_check = inverter_voltage
+
         battery_is_low = battery_present and voltage_for_low_check < settings.BATTERY_LOW_VOLTAGE_V
         self.battery_low_alarm.update(battery_is_low, f"battery voltage {voltage_for_low_check}V (threshold {settings.BATTERY_LOW_VOLTAGE_V}V)", now)
         self.client.publish(f"{settings.BASE_TOPIC}/battery/low_voltage_status", "low" if battery_is_low else "ok")
+
         return battery_present, estimated_soc, battery_is_low, bms_available
 
     def _publish_bms_status_change(self, bms_available):
         bms_status = "online" if bms_available else "offline"
         self.client.publish(f"{settings.BASE_TOPIC}/can_battery/bms_soc_status", bms_status)
+
         if self._bms_was_online is not None and bms_available != self._bms_was_online:
             if bms_available:
                 print("BMS SOC data restored, trusting BMS for discharge protection", flush=True)
@@ -371,8 +413,44 @@ class SolarMonitor:
             print(f"WARNING: BMS offline and no solar charging for {int(elapsed / 3600)}h, "
                   "forcing SUB and solar_and_utility charging", flush=True)
 
+    def _verify_inverter_mode(self, estimated_soc, battery_present, now):
+        if self._last_mode_verify_time is not None:
+            if (now - self._last_mode_verify_time) < MODE_VERIFY_INTERVAL_SECONDS:
+                return
+        self._last_mode_verify_time = now
+
+        if not battery_present:
+            return
+
+        actual_priority = self.inverter.query_output_source_priority()
+
+        if actual_priority is None:
+            return
+
+        switch_to_sbu_soc = self.battery_mode.quick_charge_switch_soc_pct
+        preemptive_sub_soc = self.battery_mode.stop_soc_pct + PREEMPTIVE_SOC_MARGIN_PCT
+
+        if actual_priority == "SUB" and estimated_soc >= switch_to_sbu_soc:
+            if self.battery_mode.is_low_battery_active:
+                self.battery_mode.clear_low_battery()
+            pop_command = OUTPUT_PRIORITY_TO_POP["SBU"]
+
+            if self.inverter.set_output_priority(pop_command):
+                self.last_applied_priority = "SBU"
+                print(f"mode verify: SUB → SBU (SOC {estimated_soc}% >= {switch_to_sbu_soc}%)", flush=True)
+            return
+
+        if actual_priority == "SBU" and estimated_soc <= preemptive_sub_soc:
+            self.battery_mode.accept_inverter_protection()
+            pop_command = OUTPUT_PRIORITY_TO_POP["SUB"]
+
+            if self.inverter.set_output_priority(pop_command):
+                self.last_applied_priority = "SUB"
+                print(f"mode verify: SBU → SUB (SOC {estimated_soc}% <= {preemptive_sub_soc}%)", flush=True)
+
     def _apply_battery_mode(self, estimated_soc, battery_present, bms_available, pv_power_w):
         inverter_capacity_pct = None
+
         if self.inverter.last_data is not None:
             inverter_capacity_pct = self.inverter.last_data.get("battery_capacity_pct")
 
@@ -380,6 +458,7 @@ class SolarMonitor:
             estimated_soc, battery_present, pv_power_w,
             inverter_capacity_pct, bms_available,
         )
+
         if mode_change is not None:
             print(f"battery mode: {mode_change}", flush=True)
 
@@ -389,16 +468,21 @@ class SolarMonitor:
 
     def _apply_output_priority(self, estimated_soc, inverter_capacity_pct):
         desired_priority = self.battery_mode.desired_output_priority
+
         if desired_priority == self.last_applied_priority:
             return
+
         pop_command = OUTPUT_PRIORITY_TO_POP[desired_priority]
+
         if self.inverter.set_output_priority(pop_command):
             self.last_applied_priority = desired_priority
             self.output_priority_fault = False
             print(f"output priority: {desired_priority} (SOC {estimated_soc}%)", flush=True)
             return
+
         self.output_priority_fault = True
         actual_priority = self.inverter.query_output_source_priority()
+
         if actual_priority is not None:
             self.last_applied_priority = actual_priority
         if desired_priority == "SBU" and self.last_applied_priority == "SUB":
@@ -410,11 +494,13 @@ class SolarMonitor:
 
     def _apply_charger_source(self):
         effective_charger = self.battery_mode.desired_charger_source
+
         if self._bms_offline_fallback_active:
             effective_charger = "solar_and_utility"
         if effective_charger == self.last_applied_charger_source:
             return
         pcp_command = settings.CHARGER_SOURCE_TO_PCP[effective_charger]
+
         if self.inverter.set_charger_source(pcp_command):
             self.last_applied_charger_source = effective_charger
             print(f"charger source: {effective_charger}", flush=True)
@@ -424,12 +510,14 @@ class SolarMonitor:
         self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/display", MODE_DISPLAY[self.battery_mode.selected_mode])
         self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/low_battery_active",
                             "ON" if self.battery_mode.is_low_battery_active else "OFF")
+
         self.client.publish(f"{settings.BASE_TOPIC}/output_priority/state", self.last_applied_priority or "unknown")
         self.client.publish(f"{settings.BASE_TOPIC}/output_priority/command_fault",
                             "ON" if self.output_priority_fault else "OFF")
         self.client.publish(f"{settings.BASE_TOPIC}/charger_source/effective", self.last_applied_charger_source or "unknown")
         self.client.publish(f"{settings.BASE_TOPIC}/charger_source/bms_offline_fallback",
                             "ON" if self._bms_offline_fallback_active else "OFF")
+
         self.client.publish(f"{settings.BASE_TOPIC}/battery/discharge_stop_soc/state", self.battery_mode.stop_soc_pct)
         self.client.publish(f"{settings.BASE_TOPIC}/battery/discharge_resume_soc/state", self.battery_mode.resume_soc_pct)
         self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/quick_charge_switch_soc/state",
@@ -439,19 +527,23 @@ class SolarMonitor:
         desired_bond_state = self.npe_bonding.decide(ac_input_voltage_v, grid_power_w, zmai_online, inverter_online, now)
         self.npe_bonding.apply(desired_bond_state)
         self.client.publish(f"{settings.BASE_TOPIC}/npe_bonding/state", "ON" if self.npe_bonding.is_bonded else "OFF")
+
         for reason_key, reason_value in self.npe_bonding.last_reasons.items():
             self.client.publish(f"{settings.BASE_TOPIC}/npe_bonding/debug/{reason_key}", reason_value)
         self.client.publish(f"{settings.BASE_TOPIC}/npe_bonding/mode/state", self.npe_bonding.mode)
 
     def _check_pi_throttle(self, now):
         throttled_hex = read_throttled_hex()
+
         if throttled_hex is None:
             return
+
         undervoltage_active = bool(throttled_hex & 0x1)
         active_flags = decode_active_flags(throttled_hex)
         self.undervoltage_alarm.update(undervoltage_active, f"flags: {', '.join(active_flags) or 'none'}", now)
         self.client.publish(f"{settings.BASE_TOPIC}/pi/undervoltage", "ON" if undervoltage_active else "OFF")
         self.client.publish(f"{settings.BASE_TOPIC}/pi/throttled_raw", hex(throttled_hex))
+
         if active_flags:
             self.client.publish(f"{settings.BASE_TOPIC}/pi/throttle_flags", ", ".join(active_flags))
         else:
@@ -461,6 +553,7 @@ class SolarMonitor:
     def _sleep_until_next_cycle(cycle_start):
         elapsed = time.time() - cycle_start
         remaining = settings.POLL_INTERVAL_SECONDS - elapsed
+
         if remaining > 0:
             time.sleep(remaining)
 
