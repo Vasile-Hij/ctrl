@@ -174,4 +174,5 @@ class HomeAssistantDiscovery:
                 "max": maximum,
                 "step": step,
                 "unit_of_measurement": unit,
+                "mode": "box",
             })
