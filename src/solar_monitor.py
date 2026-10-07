@@ -63,6 +63,7 @@ class SolarMonitor:
         self.battery_mode = BatteryMode(
             settings.BATTERY_DISCHARGE_STOP_SOC_PCT,
             settings.BATTERY_RESUME_SOC_PCT,
+            settings.GRID_QUICK_CHARGE_SOC_PCT,
         )
         self.undervoltage_alarm = Alarm("pi-undervoltage", settings.ALARM_REPEAT_SECONDS)
 
@@ -92,7 +93,7 @@ class SolarMonitor:
             settings.PV2_RATIO_TOPIC: self._handle_pv2_ratio,
             settings.DISCHARGE_STOP_SOC_TOPIC: self._handle_discharge_stop_soc,
             settings.DISCHARGE_RESUME_SOC_TOPIC: self._handle_discharge_resume_soc,
-            settings.QUICK_CHARGE_SWITCH_SOC_TOPIC: self._handle_quick_charge_switch_soc,
+            settings.GRID_QUICK_CHARGE_SOC_TOPIC: self._handle_grid_quick_charge_soc,
         }
         self._source_mtimes = self._snapshot_source_mtimes()
 
@@ -160,27 +161,39 @@ class SolarMonitor:
             return
         value = int(float(payload))
 
-        if 10 <= value <= 50:
-            self.battery_mode.stop_soc_pct = value
-            print(f"discharge stop SOC set to {value}%", flush=True)
+        if not (10 <= value <= 50):
+            return
+        if value >= self.battery_mode.resume_soc_pct:
+            print(f"rejected low battery protection {value}% — must be below grid stop charging {self.battery_mode.resume_soc_pct}%", flush=True)
+            return
+        self.battery_mode.stop_soc_pct = value
+        print(f"low battery protection set to {value}%", flush=True)
 
     def _handle_discharge_resume_soc(self, payload):
         if not is_number(payload):
             return
         value = int(float(payload))
 
-        if 50 <= value <= 100:
-            self.battery_mode.resume_soc_pct = value
-            print(f"discharge resume SOC set to {value}%", flush=True)
+        if not (30 <= value <= 100):
+            return
+        if value <= self.battery_mode.stop_soc_pct:
+            print(f"rejected grid stop charging {value}% — must be above low battery protection {self.battery_mode.stop_soc_pct}%", flush=True)
+            return
+        self.battery_mode.resume_soc_pct = value
+        print(f"grid stop charging SOC set to {value}%", flush=True)
 
-    def _handle_quick_charge_switch_soc(self, payload):
+    def _handle_grid_quick_charge_soc(self, payload):
         if not is_number(payload):
             return
         value = int(float(payload))
 
-        if 20 <= value <= 100:
-            self.battery_mode.quick_charge_switch_soc_pct = value
-            print(f"quick charge switch SOC set to {value}%", flush=True)
+        if not (30 <= value <= 100):
+            return
+        if value <= self.battery_mode.stop_soc_pct:
+            print(f"rejected grid quick charge {value}% — must be above low battery protection {self.battery_mode.stop_soc_pct}%", flush=True)
+            return
+        self.battery_mode.quick_charge_soc_pct = value
+        print(f"grid quick charge SOC set to {value}%", flush=True)
 
     def _connect_mqtt(self):
         self.client.username_pw_set(settings.MQTT_USER, settings.MQTT_PASSWORD)
@@ -427,17 +440,17 @@ class SolarMonitor:
         if actual_priority is None:
             return
 
-        switch_to_sbu_soc = self.battery_mode.quick_charge_switch_soc_pct
+        resume_soc = self.battery_mode.resume_soc_pct
         preemptive_sub_soc = self.battery_mode.stop_soc_pct + PREEMPTIVE_SOC_MARGIN_PCT
 
-        if actual_priority == "SUB" and estimated_soc >= switch_to_sbu_soc:
+        if actual_priority == "SUB" and estimated_soc >= resume_soc:
             if self.battery_mode.is_low_battery_active:
                 self.battery_mode.clear_low_battery()
             pop_command = OUTPUT_PRIORITY_TO_POP["SBU"]
 
             if self.inverter.set_output_priority(pop_command):
                 self.last_applied_priority = "SBU"
-                print(f"mode verify: SUB → SBU (SOC {estimated_soc}% >= {switch_to_sbu_soc}%)", flush=True)
+                print(f"mode verify: SUB → SBU (SOC {estimated_soc}% >= {resume_soc}%)", flush=True)
             return
 
         if actual_priority == "SBU" and estimated_soc <= preemptive_sub_soc:
@@ -520,8 +533,7 @@ class SolarMonitor:
 
         self.client.publish(f"{settings.BASE_TOPIC}/battery/discharge_stop_soc/state", self.battery_mode.stop_soc_pct)
         self.client.publish(f"{settings.BASE_TOPIC}/battery/discharge_resume_soc/state", self.battery_mode.resume_soc_pct)
-        self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/quick_charge_switch_soc/state",
-                            self.battery_mode.quick_charge_switch_soc_pct)
+        self.client.publish(f"{settings.BASE_TOPIC}/battery/grid_quick_charge_soc/state", self.battery_mode.quick_charge_soc_pct)
 
     def _apply_npe_bonding(self, ac_input_voltage_v, grid_power_w, zmai_online, inverter_online, now):
         desired_bond_state = self.npe_bonding.decide(ac_input_voltage_v, grid_power_w, zmai_online, inverter_online, now)
