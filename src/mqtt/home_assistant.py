@@ -63,7 +63,7 @@ TEXT_SENSORS = [
     ("bms_warnings", "BMS Warnings", f"{settings.BASE_TOPIC}/can_battery/bms_warnings"),
     ("bms_manufacturer", "BMS Manufacturer", f"{settings.BASE_TOPIC}/can_battery/bms_manufacturer"),
     ("charger_source_effective", "Charger Source Effective", f"{settings.BASE_TOPIC}/charger_source/effective"),
-    ("battery_mode_display", "Battery Mode Display", f"{settings.BASE_TOPIC}/battery_mode/display"),
+    ("battery_mode_display", "Battery Mode Status", f"{settings.BASE_TOPIC}/battery_mode/display"),
     ("pi_throttle_flags", "RPi Throttle Flags", f"{settings.BASE_TOPIC}/pi/throttle_flags"),
 ]
 
@@ -86,9 +86,12 @@ SELECTS = [
 
 # (object_id, name, state_topic, command_topic, minimum, maximum, step, unit)
 NUMBERS = [
-    ("discharge_stop_soc", "Low Battery Protection", f"{settings.BASE_TOPIC}/battery/discharge_stop_soc/state", settings.DISCHARGE_STOP_SOC_TOPIC, 10, 50, 1, "%"),
-    ("discharge_resume_soc", "Grid Stop Charging", f"{settings.BASE_TOPIC}/battery/discharge_resume_soc/state", settings.DISCHARGE_RESUME_SOC_TOPIC, 30, 100, 1, "%"),
-    ("grid_quick_charge_soc", "Grid Quick Charge", f"{settings.BASE_TOPIC}/battery/grid_quick_charge_soc/state", settings.GRID_QUICK_CHARGE_SOC_TOPIC, 30, 100, 1, "%"),
+    ("discharge_stop_soc", "Low Battery Protection", f"{settings.BASE_TOPIC}/battery/discharge_stop_soc/state",
+     settings.LOW_BATTERY_PROTECTION_SOC_TOPIC, *settings.LOW_BATTERY_PROTECTION_SOC_RANGE, 1, "%"),
+    ("discharge_resume_soc", "Grid Stop Charging", f"{settings.BASE_TOPIC}/battery/discharge_resume_soc/state",
+     settings.GRID_STOP_CHARGING_SOC_TOPIC, *settings.GRID_STOP_CHARGING_SOC_RANGE, 1, "%"),
+    ("grid_quick_charge_soc", "Grid Quick Charge", f"{settings.BASE_TOPIC}/battery/grid_quick_charge_soc/state",
+     settings.GRID_QUICK_CHARGE_SOC_TOPIC, *settings.GRID_QUICK_CHARGE_SOC_RANGE, 1, "%"),
 ]
 
 

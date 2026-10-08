@@ -1,6 +1,6 @@
 """Main service: polls the inverter, listens to the ZMAi meter, drives N-PE bonding.
 
-Ties together ZmaiMeter, DaxtromnInverter, NpeBonding, BatteryDischargeGuard,
+Ties together ZmaiMeter, DaxtromnInverter, NpeBonding, BatteryMode,
 and Home Assistant discovery over a single MQTT client, one cycle every
 POLL_INTERVAL_SECONDS.
 """
@@ -17,7 +17,7 @@ import settings
 from alarm import Alarm
 from batteries.battery import estimate_soc_from_voltage
 from batteries.can_battery import CanBattery
-from inverter.battery_mode import BatteryMode, BATTERY_MODES, MODE_DISPLAY, OUTPUT_PRIORITY_TO_POP
+from inverter.battery_mode import BatteryMode, OUTPUT_PRIORITY_TO_POP
 from inverter.inverter import DaxtromnInverter, BATTERY_CURRENT_NOISE_A, COMMAND_MAX_RETRIES
 from inverter.pi30 import is_number
 from mqtt.home_assistant import HomeAssistantDiscovery
@@ -61,8 +61,8 @@ class SolarMonitor:
 
         self.battery_low_alarm = Alarm("battery-low-voltage", settings.ALARM_REPEAT_SECONDS)
         self.battery_mode = BatteryMode(
-            settings.BATTERY_DISCHARGE_STOP_SOC_PCT,
-            settings.BATTERY_RESUME_SOC_PCT,
+            settings.LOW_BATTERY_PROTECTION_SOC_PCT,
+            settings.GRID_STOP_CHARGING_SOC_PCT,
             settings.GRID_QUICK_CHARGE_SOC_PCT,
         )
         self.undervoltage_alarm = Alarm("pi-undervoltage", settings.ALARM_REPEAT_SECONDS)
@@ -91,8 +91,8 @@ class SolarMonitor:
             settings.BATTERY_MODE_TOPIC: self._handle_battery_mode,
             settings.PV_EFFICIENCY_TOPIC: self._handle_pv_efficiency,
             settings.PV2_RATIO_TOPIC: self._handle_pv2_ratio,
-            settings.DISCHARGE_STOP_SOC_TOPIC: self._handle_discharge_stop_soc,
-            settings.DISCHARGE_RESUME_SOC_TOPIC: self._handle_discharge_resume_soc,
+            settings.LOW_BATTERY_PROTECTION_SOC_TOPIC: self._handle_low_battery_protection_soc,
+            settings.GRID_STOP_CHARGING_SOC_TOPIC: self._handle_grid_stop_charging_soc,
             settings.GRID_QUICK_CHARGE_SOC_TOPIC: self._handle_grid_quick_charge_soc,
         }
         self._source_mtimes = self._snapshot_source_mtimes()
@@ -133,10 +133,11 @@ class SolarMonitor:
             self.npe_bonding.mode = payload
 
     def _handle_battery_mode(self, payload):
-        if self.battery_mode.select(payload):
-            self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/state", payload)
-            self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/display", MODE_DISPLAY[payload])
-            print(f"battery mode set to {payload} ({MODE_DISPLAY[payload]})", flush=True)
+        if not self.battery_mode.select(payload):
+            return
+        self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/state", self.battery_mode.selected_mode)
+        self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/display", self.battery_mode.status_description)
+        print(f"battery mode set to {self.battery_mode.status_description}", flush=True)
 
     def _handle_pv_efficiency(self, payload):
         if not is_number(payload):
@@ -156,44 +157,56 @@ class SolarMonitor:
             self.pv2_pv1_ratio = value
             print(f"pv2/pv1 ratio set to {value}", flush=True)
 
-    def _handle_discharge_stop_soc(self, payload):
+    @staticmethod
+    def _parse_soc_in_range(payload, soc_range):
         if not is_number(payload):
-            return
+            return None
         value = int(float(payload))
+        minimum, maximum = soc_range
 
-        if not (10 <= value <= 50):
+        if minimum <= value <= maximum:
+            return value
+        return None
+
+    def _handle_low_battery_protection_soc(self, payload):
+        value = self._parse_soc_in_range(payload, settings.LOW_BATTERY_PROTECTION_SOC_RANGE)
+        highest_allowed = min(
+            self.battery_mode.grid_stop_charging_soc_pct - settings.GRID_STOP_CHARGING_MINIMUM_GAP_PCT,
+            self.battery_mode.grid_quick_charge_soc_pct - 1,
+        )
+
+        if value is None:
             return
-        if value >= self.battery_mode.resume_soc_pct:
-            print(f"rejected low battery protection {value}% — must be below grid stop charging {self.battery_mode.resume_soc_pct}%", flush=True)
+        if value > highest_allowed:
+            print(f"rejected low battery protection {value}%: maximum is {highest_allowed}%", flush=True)
             return
-        self.battery_mode.stop_soc_pct = value
+        self.battery_mode.low_battery_protection_soc_pct = value
         print(f"low battery protection set to {value}%", flush=True)
 
-    def _handle_discharge_resume_soc(self, payload):
-        if not is_number(payload):
-            return
-        value = int(float(payload))
+    def _handle_grid_stop_charging_soc(self, payload):
+        value = self._parse_soc_in_range(payload, settings.GRID_STOP_CHARGING_SOC_RANGE)
+        lowest_allowed = self.battery_mode.low_battery_protection_soc_pct + settings.GRID_STOP_CHARGING_MINIMUM_GAP_PCT
 
-        if not (30 <= value <= 100):
+        if value is None:
             return
-        if value <= self.battery_mode.stop_soc_pct:
-            print(f"rejected grid stop charging {value}% — must be above low battery protection {self.battery_mode.stop_soc_pct}%", flush=True)
+        if value < lowest_allowed:
+            print(f"rejected grid stop charging {value}%: minimum is {lowest_allowed}% "
+                  f"(low battery protection + {settings.GRID_STOP_CHARGING_MINIMUM_GAP_PCT}%)", flush=True)
             return
-        self.battery_mode.resume_soc_pct = value
-        print(f"grid stop charging SOC set to {value}%", flush=True)
+        self.battery_mode.grid_stop_charging_soc_pct = value
+        print(f"grid stop charging set to {value}%", flush=True)
 
     def _handle_grid_quick_charge_soc(self, payload):
-        if not is_number(payload):
-            return
-        value = int(float(payload))
+        value = self._parse_soc_in_range(payload, settings.GRID_QUICK_CHARGE_SOC_RANGE)
 
-        if not (30 <= value <= 100):
+        if value is None:
             return
-        if value <= self.battery_mode.stop_soc_pct:
-            print(f"rejected grid quick charge {value}% — must be above low battery protection {self.battery_mode.stop_soc_pct}%", flush=True)
+        if value <= self.battery_mode.low_battery_protection_soc_pct:
+            print(f"rejected grid quick charge {value}%: must be above low battery protection "
+                  f"{self.battery_mode.low_battery_protection_soc_pct}%", flush=True)
             return
-        self.battery_mode.quick_charge_soc_pct = value
-        print(f"grid quick charge SOC set to {value}%", flush=True)
+        self.battery_mode.grid_quick_charge_soc_pct = value
+        print(f"grid quick charge set to {value}%", flush=True)
 
     def _connect_mqtt(self):
         self.client.username_pw_set(settings.MQTT_USER, settings.MQTT_PASSWORD)
@@ -250,9 +263,8 @@ class SolarMonitor:
         can_data = self.can_battery.get_data() if self.can_battery.has_recent_data(now) else None
         battery_present, estimated_soc, battery_is_low, bms_available = self._assess_battery(inverter_data, can_data, now)
         self._check_bms_offline_fallback(inverter_data, bms_available, battery_present, now)
-        pv_power_for_mode = inverter_data.get("pv1_power_w") if inverter_data is not None else None
 
-        self._apply_battery_mode(estimated_soc, battery_present, bms_available, pv_power_for_mode)
+        self._apply_battery_mode(estimated_soc, battery_present, bms_available)
         self._verify_inverter_mode(estimated_soc, battery_present, now)
         ac_input_voltage_v = inverter_data.get("ac_input_voltage_v") if inverter_data is not None else None
         inverter_online = self.inverter.has_recent_data(now)
@@ -432,7 +444,7 @@ class SolarMonitor:
                 return
         self._last_mode_verify_time = now
 
-        if not battery_present:
+        if not battery_present or self.battery_mode.selected_mode != "auto":
             return
 
         actual_priority = self.inverter.query_output_source_priority()
@@ -440,17 +452,17 @@ class SolarMonitor:
         if actual_priority is None:
             return
 
-        resume_soc = self.battery_mode.resume_soc_pct
-        preemptive_sub_soc = self.battery_mode.stop_soc_pct + PREEMPTIVE_SOC_MARGIN_PCT
+        grid_stop_charging_soc = self.battery_mode.grid_stop_charging_soc_pct
+        preemptive_sub_soc = self.battery_mode.low_battery_protection_soc_pct + PREEMPTIVE_SOC_MARGIN_PCT
 
-        if actual_priority == "SUB" and estimated_soc >= resume_soc:
+        if actual_priority == "SUB" and estimated_soc >= grid_stop_charging_soc:
             if self.battery_mode.is_low_battery_active:
                 self.battery_mode.clear_low_battery()
             pop_command = OUTPUT_PRIORITY_TO_POP["SBU"]
 
             if self.inverter.set_output_priority(pop_command):
                 self.last_applied_priority = "SBU"
-                print(f"mode verify: SUB → SBU (SOC {estimated_soc}% >= {resume_soc}%)", flush=True)
+                print(f"mode verify: SUB → SBU (SOC {estimated_soc}% >= {grid_stop_charging_soc}%)", flush=True)
             return
 
         if actual_priority == "SBU" and estimated_soc <= preemptive_sub_soc:
@@ -461,15 +473,14 @@ class SolarMonitor:
                 self.last_applied_priority = "SUB"
                 print(f"mode verify: SBU → SUB (SOC {estimated_soc}% <= {preemptive_sub_soc}%)", flush=True)
 
-    def _apply_battery_mode(self, estimated_soc, battery_present, bms_available, pv_power_w):
+    def _apply_battery_mode(self, estimated_soc, battery_present, bms_available):
         inverter_capacity_pct = None
 
         if self.inverter.last_data is not None:
             inverter_capacity_pct = self.inverter.last_data.get("battery_capacity_pct")
 
         mode_change = self.battery_mode.update(
-            estimated_soc, battery_present, pv_power_w,
-            inverter_capacity_pct, bms_available,
+            estimated_soc, battery_present, inverter_capacity_pct, bms_available,
         )
 
         if mode_change is not None:
@@ -520,7 +531,7 @@ class SolarMonitor:
 
     def _publish_battery_mode_state(self):
         self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/state", self.battery_mode.selected_mode)
-        self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/display", MODE_DISPLAY[self.battery_mode.selected_mode])
+        self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/display", self.battery_mode.status_description)
         self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/low_battery_active",
                             "ON" if self.battery_mode.is_low_battery_active else "OFF")
 
@@ -531,9 +542,12 @@ class SolarMonitor:
         self.client.publish(f"{settings.BASE_TOPIC}/charger_source/bms_offline_fallback",
                             "ON" if self._bms_offline_fallback_active else "OFF")
 
-        self.client.publish(f"{settings.BASE_TOPIC}/battery/discharge_stop_soc/state", self.battery_mode.stop_soc_pct)
-        self.client.publish(f"{settings.BASE_TOPIC}/battery/discharge_resume_soc/state", self.battery_mode.resume_soc_pct)
-        self.client.publish(f"{settings.BASE_TOPIC}/battery/grid_quick_charge_soc/state", self.battery_mode.quick_charge_soc_pct)
+        self.client.publish(f"{settings.BASE_TOPIC}/battery/discharge_stop_soc/state",
+                            self.battery_mode.low_battery_protection_soc_pct)
+        self.client.publish(f"{settings.BASE_TOPIC}/battery/discharge_resume_soc/state",
+                            self.battery_mode.grid_stop_charging_soc_pct)
+        self.client.publish(f"{settings.BASE_TOPIC}/battery/grid_quick_charge_soc/state",
+                            self.battery_mode.grid_quick_charge_soc_pct)
 
     def _apply_npe_bonding(self, ac_input_voltage_v, grid_power_w, zmai_online, inverter_online, now):
         desired_bond_state = self.npe_bonding.decide(ac_input_voltage_v, grid_power_w, zmai_online, inverter_online, now)
