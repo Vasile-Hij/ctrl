@@ -1,165 +1,165 @@
-from inverter.battery_mode import BatteryMode, BATTERY_MODE_DEFAULT
+from inverter.battery_mode import BatteryMode, BATTERY_MODES, BATTERY_MODE_DEFAULT
 
 
-class TestBatteryModeSelection:
+def create_battery_mode():
+    return BatteryMode(
+        low_battery_protection_soc_pct=10,
+        grid_stop_charging_soc_pct=30,
+        grid_quick_charge_soc_pct=90,
+    )
 
-    def test_initial_mode_is_battery_savings(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        assert mode.selected_mode == "battery_savings"
 
-    def test_select_valid_mode(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        assert mode.select("battery_quick_charge") is True
-        assert mode.selected_mode == "battery_quick_charge"
+class TestModeSelection:
 
-    def test_select_invalid_mode(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        assert mode.select("invalid") is False
-        assert mode.selected_mode == BATTERY_MODE_DEFAULT
+    def test_selectable_modes_are_auto_and_manual(self):
+        assert BATTERY_MODES == ("auto", "manual")
+
+    def test_default_is_auto_normal(self):
+        mode = create_battery_mode()
+        assert mode.selected_mode == BATTERY_MODE_DEFAULT == "auto"
+        assert mode.state == "auto_normal"
+
+    def test_select_invalid_mode_is_rejected(self):
+        mode = create_battery_mode()
+        assert mode.select("battery_savings") is False
+        assert mode.selected_mode == "auto"
 
     def test_select_clears_low_battery(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        mode.update(5, battery_present=True, pv_power_w=0, bms_available=True)
+        mode = create_battery_mode()
+        mode.update(5, battery_present=True, bms_available=True)
         assert mode.is_low_battery_active is True
-        mode.select("battery_charge_slow")
+        mode.select("auto")
         assert mode.is_low_battery_active is False
 
 
-class TestBatteryModeSettings:
+class TestAutoMode:
 
-    def test_battery_savings_output_priority(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
+    def test_normal_is_sbu_solar_only(self):
+        mode = create_battery_mode()
         assert mode.desired_output_priority == "SBU"
-
-    def test_battery_savings_charger_source(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
         assert mode.desired_charger_source == "solar_only"
+        assert mode.status_description == "auto: normal (SBU + solar_only)"
 
-    def test_battery_charge_slow_settings(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        mode.select("battery_charge_slow")
+    def test_low_battery_protection_switches_to_sub_solar_first(self):
+        mode = create_battery_mode()
+        assert mode.update(10, battery_present=True, bms_available=True) is not None
+        assert mode.state == "auto_low_battery"
         assert mode.desired_output_priority == "SUB"
         assert mode.desired_charger_source == "solar_first"
+        assert mode.status_description == "auto: low battery protection (SUB + solar_first)"
 
-    def test_battery_quick_charge_settings(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        mode.select("battery_quick_charge")
-        assert mode.desired_output_priority == "USB"
-        assert mode.desired_charger_source == "solar_and_utility"
+    def test_above_low_battery_protection_stays_normal(self):
+        mode = create_battery_mode()
+        assert mode.update(11, battery_present=True, bms_available=True) is None
+        assert mode.state == "auto_normal"
 
+    def test_stays_protected_below_grid_stop_charging(self):
+        mode = create_battery_mode()
+        mode.update(8, battery_present=True, bms_available=True)
+        assert mode.update(29, battery_present=True, bms_available=True) is None
+        assert mode.state == "auto_low_battery"
 
-class TestLowBatteryProtection:
-
-    def test_low_soc_forces_sub_solar_first(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30)
-        result = mode.update(7, battery_present=True, pv_power_w=0, bms_available=True)
-        assert result is not None
-        assert mode.desired_output_priority == "SUB"
-        assert mode.desired_charger_source == "solar_first"
-
-    def test_soc_above_stop_no_trigger(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        result = mode.update(50, battery_present=True, pv_power_w=0, bms_available=True)
-        assert result is None
-        assert mode.desired_output_priority == "SBU"
-
-    def test_recovery_switches_to_battery_savings(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30)
-        mode.select("battery_quick_charge")
-        mode.update(5, battery_present=True, pv_power_w=0, bms_available=True)
-        assert mode.desired_output_priority == "SUB"
-        result = mode.update(35, battery_present=True, pv_power_w=0, bms_available=True)
-        assert result is not None
-        assert mode.selected_mode == "battery_savings"
+    def test_grid_stop_charging_returns_to_sbu_solar_only(self):
+        mode = create_battery_mode()
+        mode.update(8, battery_present=True, bms_available=True)
+        assert mode.update(30, battery_present=True, bms_available=True) is not None
+        assert mode.state == "auto_normal"
         assert mode.desired_output_priority == "SBU"
         assert mode.desired_charger_source == "solar_only"
 
-    def test_no_recovery_below_resume_threshold(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        mode.update(5, battery_present=True, pv_power_w=0, bms_available=True)
-        result = mode.update(30, battery_present=True, pv_power_w=0, bms_available=True)
-        assert result is None
-        assert mode.desired_output_priority == "SUB"
+    def test_no_battery_forces_sub_solar_first(self):
+        mode = create_battery_mode()
+        assert mode.update(0, battery_present=False, bms_available=False) is not None
+        assert mode.state == "auto_low_battery"
 
-    def test_no_battery_no_bms_forces_sub(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30)
-        result = mode.update(80, battery_present=False, pv_power_w=0, bms_available=False)
-        assert result is not None
-        assert mode.desired_output_priority == "SUB"
-        assert mode.desired_charger_source == "solar_first"
+    def test_inverter_capacity_fallback_uses_safety_margin(self):
+        mode = create_battery_mode()
+        mode.update(50, battery_present=True, inverter_capacity_pct=20, bms_available=False)
+        assert mode.state == "auto_low_battery"
 
-    def test_inverter_fallback_with_margin(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        result = mode.update(
-            50, battery_present=True, pv_power_w=0,
-            inverter_capacity_pct=18, bms_available=False,
-        )
-        assert result is not None
-        assert mode.desired_output_priority == "SUB"
-
-    def test_inverter_fallback_above_margin_no_trigger(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
-        result = mode.update(
-            50, battery_present=True, pv_power_w=0,
-            inverter_capacity_pct=25, bms_available=False,
-        )
-        assert result is None
+    def test_inverter_capacity_above_margin_stays_normal(self):
+        mode = create_battery_mode()
+        mode.update(50, battery_present=True, inverter_capacity_pct=21, bms_available=False)
+        assert mode.state == "auto_normal"
 
     def test_accept_inverter_protection(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=50)
+        mode = create_battery_mode()
         mode.accept_inverter_protection()
-        assert mode.is_low_battery_active is True
+        assert mode.state == "auto_low_battery"
+
+
+class TestManualMode:
+
+    def test_grid_quick_charge_is_usb_solar_and_utility(self):
+        mode = create_battery_mode()
+        mode.select("manual")
+        assert mode.state == "manual_grid_charging"
+        assert mode.desired_output_priority == "USB"
+        assert mode.desired_charger_source == "solar_and_utility"
+        assert mode.status_description == "manual: grid quick charge (USB + solar_and_utility)"
+
+    def test_keeps_grid_charging_below_target(self):
+        mode = create_battery_mode()
+        mode.select("manual")
+        assert mode.update(89, battery_present=True, bms_available=True) is None
+        assert mode.state == "manual_grid_charging"
+
+    def test_target_reached_holds_sub_solar_first(self):
+        mode = create_battery_mode()
+        mode.select("manual")
+        assert mode.update(90, battery_present=True, bms_available=True) is not None
+        assert mode.selected_mode == "manual"
+        assert mode.state == "manual_charged"
         assert mode.desired_output_priority == "SUB"
-
-    def test_low_battery_uses_solar_first_charger(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30)
-        mode.select("battery_quick_charge")
-        mode.update(5, battery_present=True, pv_power_w=0, bms_available=True)
         assert mode.desired_charger_source == "solar_first"
+        assert mode.status_description == "manual: charged, holding (SUB + solar_first)"
+
+    def test_charged_does_not_restart_grid_charging_when_soc_drops(self):
+        mode = create_battery_mode()
+        mode.select("manual")
+        mode.update(90, battery_present=True, bms_available=True)
+        assert mode.update(80, battery_present=True, bms_available=True) is None
+        assert mode.state == "manual_charged"
+
+    def test_low_soc_does_not_interrupt_grid_charging(self):
+        mode = create_battery_mode()
+        mode.select("manual")
+        assert mode.update(5, battery_present=True, bms_available=True) is None
+        assert mode.state == "manual_grid_charging"
+        assert mode.is_low_battery_active is False
+
+    def test_inverter_protection_ignored_in_manual(self):
+        mode = create_battery_mode()
+        mode.select("manual")
+        mode.accept_inverter_protection()
+        assert mode.state == "manual_grid_charging"
+
+    def test_reselecting_manual_restarts_grid_charging(self):
+        mode = create_battery_mode()
+        mode.select("manual")
+        mode.update(90, battery_present=True, bms_available=True)
+        mode.select("manual")
+        assert mode.state == "manual_grid_charging"
+
+    def test_selecting_auto_leaves_manual(self):
+        mode = create_battery_mode()
+        mode.select("manual")
+        mode.update(90, battery_present=True, bms_available=True)
+        mode.select("auto")
+        assert mode.state == "auto_normal"
 
 
-class TestQuickChargeAutoStop:
+class TestThresholdChanges:
 
-    def test_quick_charge_switches_to_charge_slow_at_target(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30, quick_charge_soc_pct=90)
-        mode.select("battery_quick_charge")
-        result = mode.update(92, battery_present=True, pv_power_w=0, bms_available=True)
-        assert result is not None
-        assert mode.selected_mode == "battery_charge_slow"
-        assert mode.desired_output_priority == "SUB"
-        assert mode.desired_charger_source == "solar_first"
+    def test_low_battery_protection_change_applies(self):
+        mode = create_battery_mode()
+        mode.low_battery_protection_soc_pct = 25
+        mode.update(25, battery_present=True, bms_available=True)
+        assert mode.state == "auto_low_battery"
 
-    def test_quick_charge_stays_below_target(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30, quick_charge_soc_pct=90)
-        mode.select("battery_quick_charge")
-        result = mode.update(85, battery_present=True, pv_power_w=0, bms_available=True)
-        assert result is None
-        assert mode.selected_mode == "battery_quick_charge"
-
-    def test_savings_mode_not_affected_by_quick_charge_target(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30, quick_charge_soc_pct=90)
-        result = mode.update(95, battery_present=True, pv_power_w=0, bms_available=True)
-        assert result is None
-        assert mode.selected_mode == "battery_savings"
-
-    def test_charge_slow_not_affected_by_quick_charge_target(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30, quick_charge_soc_pct=90)
-        mode.select("battery_charge_slow")
-        result = mode.update(95, battery_present=True, pv_power_w=0, bms_available=True)
-        assert result is None
-        assert mode.selected_mode == "battery_charge_slow"
-
-
-class TestManualOverridePersistence:
-
-    def test_stop_soc_persists_through_mode_change(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30)
-        mode.stop_soc_pct = 25
-        mode.select("battery_charge_slow")
-        assert mode.stop_soc_pct == 25
-
-    def test_resume_soc_persists_through_mode_change(self):
-        mode = BatteryMode(stop_soc_pct=10, resume_soc_pct=30)
-        mode.resume_soc_pct = 70
-        mode.select("battery_quick_charge")
-        assert mode.resume_soc_pct == 70
+    def test_grid_quick_charge_change_applies(self):
+        mode = create_battery_mode()
+        mode.grid_quick_charge_soc_pct = 80
+        mode.select("manual")
+        mode.update(80, battery_present=True, bms_available=True)
+        assert mode.state == "manual_charged"
