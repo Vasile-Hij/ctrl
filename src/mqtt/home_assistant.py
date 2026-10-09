@@ -43,26 +43,23 @@ MEASUREMENT_SENSORS = [
     ("bms_cell_diff", "BMS Cell Voltage Diff", f"{settings.BASE_TOPIC}/can_battery/bms_cell_diff_mv", "mV", None),
     ("bms_temp_min", "BMS Temp Min", f"{settings.BASE_TOPIC}/can_battery/bms_temp_min_c", "°C", "temperature"),
     ("bms_temp_max", "BMS Temp Max", f"{settings.BASE_TOPIC}/can_battery/bms_temp_max_c", "°C", "temperature"),
-    ("bms_capacity", "BMS Capacity", f"{settings.BASE_TOPIC}/can_battery/bms_capacity_ah", "Ah", None),
-    ("bms_module_count", "BMS Module Count", f"{settings.BASE_TOPIC}/can_battery/bms_module_count", None, None),
 ]
 
 # (object_id, name, state_topic, unit, device_class)
 ENERGY_SENSORS = [
     ("battery_charge_energy", "Battery Charge Energy 14.8kW", f"{settings.BASE_TOPIC}/derived/battery_charge_energy_kwh", "kWh", "energy"),
     ("battery_discharge_energy", "Battery Discharge Energy 14.8kW", f"{settings.BASE_TOPIC}/derived/battery_discharge_energy_kwh", "kWh", "energy"),
+    ("solar_production_energy", "Solar Production Energy", f"{settings.BASE_TOPIC}/derived/solar_production_energy_kwh", "kWh", "energy"),
+    ("grid_import_energy", "Grid Import Energy", f"{settings.BASE_TOPIC}/derived/grid_import_energy_kwh", "kWh", "energy"),
 ]
 
 # (object_id, name, state_topic)
 TEXT_SENSORS = [
     ("zmai_data", "ZMAi-90 Data Status", f"{settings.BASE_TOPIC}/zmai/data_status"),
     ("inverter_data", "Daxtromn Data Status", f"{settings.BASE_TOPIC}/inverter/data_status"),
-    ("output_priority", "Output Priority", f"{settings.BASE_TOPIC}/output_priority/state"),
     ("can_battery_data", "CAN Battery Data Status", f"{settings.BASE_TOPIC}/can_battery/data_status"),
     ("bms_alarms", "BMS Alarms", f"{settings.BASE_TOPIC}/can_battery/bms_alarms"),
     ("bms_warnings", "BMS Warnings", f"{settings.BASE_TOPIC}/can_battery/bms_warnings"),
-    ("bms_manufacturer", "BMS Manufacturer", f"{settings.BASE_TOPIC}/can_battery/bms_manufacturer"),
-    ("charger_source_effective", "Charger Source Effective", f"{settings.BASE_TOPIC}/charger_source/effective"),
     ("battery_mode_display", "Battery Mode Status", f"{settings.BASE_TOPIC}/battery_mode/display"),
     ("pi_throttle_flags", "RPi Throttle Flags", f"{settings.BASE_TOPIC}/pi/throttle_flags"),
 ]

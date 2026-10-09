@@ -84,7 +84,10 @@ class SolarMonitor:
         self.pv2_pv1_ratio = settings.PV2_PV1_RATIO_DEFAULT
         self.battery_charge_energy_kwh = 0.0
         self.battery_discharge_energy_kwh = 0.0
+        self.solar_production_energy_kwh = 0.0
+        self.grid_import_energy_kwh = 0.0
         self.last_battery_cycle_time = None
+        self.last_energy_cycle_time = None
 
         self._command_handlers = {
             settings.NPE_MODE_TOPIC: self._handle_npe_mode,
@@ -258,6 +261,8 @@ class SolarMonitor:
             battery_contribution_w = battery_power_w if self.inverter.is_battery_present(inverter_data) else 0.0
             pv_total_power_w = self._estimate_pv_power(inverter_data, battery_contribution_w, grid_power_for_pv2)
 
+        grid_power_for_energy = self.zmai_meter.power_w if zmai_online and self.zmai_meter.power_w is not None else None
+        self._accumulate_solar_grid_energy(pv_total_power_w, grid_power_for_energy, now)
         self._publish_link_status(zmai_online, now)
         self._publish_can_battery(now)
         can_data = self.can_battery.get_data() if self.can_battery.has_recent_data(now) else None
@@ -303,7 +308,7 @@ class SolarMonitor:
         battery_power_w = net_current_a * inverter_data["battery_voltage_v"]
         self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_power_w", battery_power_w)
         self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_charge_power_w", max(-battery_power_w, 0))
-        self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_discharge_power_w", -max(battery_power_w, 0))
+        self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_discharge_power_w", max(battery_power_w, 0))
         self._accumulate_battery_energy(battery_power_w, now)
 
         return battery_power_w
@@ -319,6 +324,21 @@ class SolarMonitor:
             self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_charge_energy_kwh", round(self.battery_charge_energy_kwh, 3))
             self.client.publish(f"{settings.BASE_TOPIC}/derived/battery_discharge_energy_kwh", round(self.battery_discharge_energy_kwh, 3))
         self.last_battery_cycle_time = now
+
+    def _accumulate_solar_grid_energy(self, pv_total_power_w, grid_power_w, now):
+        if self.last_energy_cycle_time is not None:
+            elapsed_hours = (now - self.last_energy_cycle_time) / 3600
+
+            if pv_total_power_w > 0:
+                self.solar_production_energy_kwh += pv_total_power_w * elapsed_hours / 1000
+            if grid_power_w is not None and grid_power_w > 0:
+                self.grid_import_energy_kwh += grid_power_w * elapsed_hours / 1000
+
+            self.client.publish(f"{settings.BASE_TOPIC}/derived/solar_production_energy_kwh",
+                                round(self.solar_production_energy_kwh, 3))
+            self.client.publish(f"{settings.BASE_TOPIC}/derived/grid_import_energy_kwh",
+                                round(self.grid_import_energy_kwh, 3))
+        self.last_energy_cycle_time = now
 
     def _estimate_total_pv_watts(self, inverter_data, battery_contribution_w, grid_power_w):
         ac_output_w = inverter_data["ac_output_power_w"]
@@ -535,10 +555,8 @@ class SolarMonitor:
         self.client.publish(f"{settings.BASE_TOPIC}/battery_mode/low_battery_active",
                             "ON" if self.battery_mode.is_low_battery_active else "OFF")
 
-        self.client.publish(f"{settings.BASE_TOPIC}/output_priority/state", self.last_applied_priority or "unknown")
         self.client.publish(f"{settings.BASE_TOPIC}/output_priority/command_fault",
                             "ON" if self.output_priority_fault else "OFF")
-        self.client.publish(f"{settings.BASE_TOPIC}/charger_source/effective", self.last_applied_charger_source or "unknown")
         self.client.publish(f"{settings.BASE_TOPIC}/charger_source/bms_offline_fallback",
                             "ON" if self._bms_offline_fallback_active else "OFF")
 
